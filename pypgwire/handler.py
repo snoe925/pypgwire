@@ -35,18 +35,21 @@ class GeneratorHandler:
                 # assume an annotated class
                 self.columns = [field.lower() for field in first.__annotations__.keys()]
         self.factory = factory
+        # Set field types
+        self.field_types = {}
+        if cls is not None:
+            self.field_types = {k.lower(): v for k, v in cls.__annotations__.items()}
+        else:
+            first = factory(None)[0]
+            if not isinstance(first, dict):
+                # assume annotated class
+                self.field_types = {k.lower(): v for k, v in first.__annotations__.items()}
         self.fields = []
         for ii, field_name in enumerate(self.columns):
-            self.fields.append(to_sqltype(ii, field_name))
+            typ = self.field_types.get(field_name)
+            self.fields.append(to_sqltype(ii, field_name, typ=typ))
 
-    def handle_query(self, msg: Query) -> List[BackendMessage]:
-        query = msg.query.strip().upper()
-        if query.upper().startswith('SELECT'):
-            return self._handle_select(msg.query)
-        else:
-            raise NotImplementedError(f"Unsupported query: {query}")
-
-    def _data_to_messages(self, sql: str = None):
+    def _data_to_messages(self, sql: str = None, text_encoding: bool = False):
         # Get rows as pgwire data
         # TODO get sql string from connection state
         rows_data: List[List[Any]] = []
@@ -58,13 +61,14 @@ class GeneratorHandler:
 
         messages = [RowDescription(self.fields)]
         for row_values in rows_data:
-            messages.append(DataRow(row_values))
+            messages.append(DataRow(row_values, self.fields, text_encoding))
         messages.append(CommandComplete(len(rows_data), b'SELECT'))
         messages.append(ReadyForQuery())
 
         return messages
 
-    def _handle_select(self, query: str) -> List[BackendMessage]:
+    def handle_query(self, msg: Query) -> List[BackendMessage]:
+        query = msg.query.strip().upper()
         # Simple parsing: SELECT columns FROM table
         match = re.match(r'SELECT\s+(.+?)\s+FROM\s+(\w+)', query.upper())
         if not match:
@@ -76,7 +80,7 @@ class GeneratorHandler:
         if self.table_name and self.table_name not in table_name:
             raise ValueError(f"table name does not match {table_name} expected {self.table_name}")
 
-        messages = self._data_to_messages(query)
+        messages = self._data_to_messages(query, True)
         return messages
 
     def handle_bind(self, msg):

@@ -1,23 +1,46 @@
 import struct
-from typing import Dict, List, Any
+from decimal import Decimal
+from typing import Dict, List, Any, Type
 
-def to_sqltype(index: int, field_name: str, schema: list[int] = None) -> dict[str, Any]:
+# OID constants for PostgreSQL builtin types
+OID_TEXT = 25  # text type
+OID_INT8 = 20  # bigint
+OID_INT2 = 21  # smallint
+OID_INT4 = 23  # integer
+OID_NUMERIC = 1700 # numeric, encoded in text format
+
+# Encoder functions for binary formats
+ENCODERS = {
+    OID_INT2: lambda v: struct.pack('>I', 2) + struct.pack('>h', v),
+    OID_INT4: lambda v: struct.pack('>I', 4) + struct.pack('>i', v),
+    OID_INT8: lambda v: struct.pack('>I', 8) + struct.pack('>q', v)
+}
+
+def to_sqltype(index: int, field_name: str, schema: list[int] = None, typ: Type | None = None) -> dict[str, Any]:
     '''
     Create a wire protocol type from a python type
     If provided use the schema which is a list of Python OIDs
     for builtin types.
     '''
-    oid = 25 # default to text
+    oid = OID_TEXT  # default to text
     format = 0
-    if schema is not None:
+    type_size = -1
+    if schema is not None and 0 <= index < len(schema):
         oid = schema[index]
-        format = 0 # TODO
+        if oid in [OID_INT8, OID_INT2, OID_INT4]:  # int8, int2, int4
+            format = 1 # binary pgasync expects binary
+    elif typ == int:  # noqa: E721
+        oid = OID_INT4  # int4
+        format = 1 # binary
+        type_size = 4
+    elif typ == float or typ == Decimal:  # noqa: E721
+        oid = OID_NUMERIC
     return {
         'name': field_name,
         'table_oid': 0,
         'column_attr': 0,
         'type_oid': oid,
-        'type_size': -1,
+        'type_size': type_size,
         'type_mod': -1,
         'format': format
         }
@@ -73,19 +96,28 @@ class RowDescription(BackendMessage):
         return b'T' + struct.pack('>I', length) + data
 
 class DataRow(BackendMessage):
-    def __init__(self, values: List[Any]):
+    def __init__(self, values: List[Any], fields: List[Dict[str, Any]], text_encoding: bool):
         self.values = values
+        self.fields = fields
+        self.text_encoding = text_encoding
 
     def encode(self) -> bytes:
         # 'D' length(4) num_values(2) values...
         # each value: len(4) data or -1 for null
         data = struct.pack('>H', len(self.values))
-        for value in self.values:
+        for i, value in enumerate(self.values):
             if value is None:
                 data += struct.pack('>I', -1)
             else:
-                val_bytes = str(value).encode('utf-8')
-                data += struct.pack('>I', len(val_bytes)) + val_bytes
+                field = self.fields[i]
+                oid = field['type_oid']
+                format_code = field['format']
+                if self.text_encoding or format_code == 0:
+                    val_bytes = str(value).encode('utf-8')
+                    data += struct.pack('>I', len(val_bytes)) + val_bytes
+                else:
+                    val_bytes = ENCODERS[oid](value)
+                    data += val_bytes
         length = 4 + len(data)
         return b'D' + struct.pack('>I', length) + data
 

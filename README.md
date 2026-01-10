@@ -23,6 +23,8 @@ First commit, so just about everything else.  A basic smoke test works.
 # Related repos
 Several projects inspired or materially helped to write this code.
 
+https://github.com/The-DevOps-Daily/pg-wire-mock
+
 https://github.com/GavinRay97/PgProtoJ.git
 
 https://github.com/jwills/buenavista.git

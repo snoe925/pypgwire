@@ -4,7 +4,6 @@ import asyncpg
 import psycopg2
 import struct
 import logging
-from concurrent.futures import ProcessPoolExecutor
 
 from pypgwire.server import start_server, DEFAULT_PORT, DEFAULT_HOST
 from pypgwire.handler import ContainerHandler
@@ -63,37 +62,42 @@ async def test_asyncpg_select_query():
     try:
         conn = await asyncpg.connect(user='test', password='test',
                                  database='database', host='127.0.0.1', ssl=False)
+
         rows = await conn.fetch(
-            'SELECT id, name FROM users'
+            'SELECT id, name, age, balance FROM users'
         )
         logging.debug(f"Query result: {rows}")
 
         # Verify results
         assert len(rows) == 3
-        assert rows[0]['id'] == '1'
+        assert rows[0]['id'] == 1
         assert rows[0]['name'] == 'John'
-        assert rows[1]['id'] == '2'
+        assert rows[1]['id'] == 2
         assert rows[1]['name'] == 'Jane'
-        assert rows[2]['id'] == '3'
+        assert rows[2]['id'] == 3
         assert rows[2]['name'] == 'Joe'
+        assert rows[2]['age'] == 78
 
         await conn.close()
-        logging.debug('Connection closed')
-    except Exception as ex:
-        raise ex
+        conn = None
     finally:
+        if conn:
+            await conn.close()
         await server_stop(server_task)
 
 
 def simple_query():
-    conn = psycopg2.connect(
-        host='127.0.0.1',
-        port=5432,
-        user='postgres',
-        password='password',  # Replace with actual password
-        database='test',  # Replace with actual database name
-        sslmode = 'disable'
-    )
+    try:
+        conn = psycopg2.connect(
+            host='127.0.0.1',
+            port=5432,
+            user='postgres',
+            password='password',  # Replace with actual password
+            database='test',  # Replace with actual database name
+            sslmode = 'disable'
+        )
+    except Exception as ex:
+        print(ex)
     conn.autocommit = True  # Disable implicit transactions
     try:
         cur = conn.cursor()
@@ -111,11 +115,7 @@ async def test_query():
     (server_task, ready_event) = server()
     await ready_event.wait()
     try:
-        loop = asyncio.get_running_loop()
-        executor = ProcessPoolExecutor(max_workers=1)
-        loop.run_in_executor(executor, simple_query)
-    except Exception as e:
-        raise e
+        await asyncio.to_thread(simple_query)
     finally:
         await server_stop(server_task)
 

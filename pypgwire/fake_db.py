@@ -2,12 +2,13 @@ from dataclasses import dataclass
 
 @dataclass
 class User:
-    id: str
+    id: int
     name: str
-    age: str
+    age: int
+    balance: str
 
 USER_DATA = [
-    User("1", "John", "30"),
-    User("2", "Jane", "25"),
-    User("3", "Joe", "20")
-    ]
+    User(id=1, name="John", age=30, balance="100.50"),
+    User(id=2, name="Jane", age=25, balance="250.75"),
+    User(id=3, name="Joe", age=78, balance="0.0")
+]

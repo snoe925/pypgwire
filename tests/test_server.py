@@ -4,6 +4,7 @@ import asyncpg
 import psycopg2
 import struct
 import logging
+from decimal import Decimal
 
 from pypgwire.server import start_server, DEFAULT_PORT, DEFAULT_HOST
 from pypgwire.handler import ContainerHandler
@@ -64,7 +65,7 @@ async def test_asyncpg_select_query():
                                  database='database', host='127.0.0.1', ssl=False)
 
         rows = await conn.fetch(
-            'SELECT id, name, age, balance FROM users'
+            'SELECT id, name, age, balance, interest FROM users'
         )
         logging.debug(f"Query result: {rows}")
 
@@ -77,6 +78,11 @@ async def test_asyncpg_select_query():
         assert rows[2]['id'] == 3
         assert rows[2]['name'] == 'Joe'
         assert rows[2]['age'] == 78
+
+        # asyncpg should decode NUMERIC into Python Decimal.
+        assert rows[0]['interest'] == Decimal('3.50')
+        assert rows[1]['interest'] == Decimal('4.125')
+        assert rows[2]['interest'] == Decimal('0')
 
         await conn.close()
         conn = None
@@ -118,4 +124,3 @@ async def test_query():
         await asyncio.to_thread(simple_query)
     finally:
         await server_stop(server_task)
-

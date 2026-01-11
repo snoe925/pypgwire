@@ -7,13 +7,15 @@ OID_TEXT = 25  # text type
 OID_INT8 = 20  # bigint
 OID_INT2 = 21  # smallint
 OID_INT4 = 23  # integer
+OID_FLOAT8 = 701  # double precision (float8)
 OID_NUMERIC = 1700 # numeric, encoded in text format
 
 # Encoder functions for binary formats
 ENCODERS = {
     OID_INT2: lambda v: struct.pack('>I', 2) + struct.pack('>h', v),
     OID_INT4: lambda v: struct.pack('>I', 4) + struct.pack('>i', v),
-    OID_INT8: lambda v: struct.pack('>I', 8) + struct.pack('>q', v)
+    OID_INT8: lambda v: struct.pack('>I', 8) + struct.pack('>q', v),
+    OID_FLOAT8: lambda v: struct.pack('>I', 8) + struct.pack('>d', v)
 }
 
 def to_sqltype(index: int, field_name: str, schema: list[int] = None, typ: Type | None = None) -> dict[str, Any]:
@@ -27,13 +29,17 @@ def to_sqltype(index: int, field_name: str, schema: list[int] = None, typ: Type 
     type_size = -1
     if schema is not None and 0 <= index < len(schema):
         oid = schema[index]
-        if oid in [OID_INT8, OID_INT2, OID_INT4]:  # int8, int2, int4
+        if oid in [OID_INT8, OID_INT2, OID_INT4, OID_FLOAT8]:  # int8, int2, int4, float8
             format = 1 # binary pgasync expects binary
     elif typ == int:  # noqa: E721
         oid = OID_INT4  # int4
         format = 1 # binary
         type_size = 4
-    elif typ == float or typ == Decimal:  # noqa: E721
+    elif typ == float:  # noqa: E721
+        oid = OID_FLOAT8  # float8
+        format = 1  # binary
+        type_size = 8
+    elif typ == Decimal:  # noqa: E721
         oid = OID_NUMERIC
     return {
         'name': field_name,

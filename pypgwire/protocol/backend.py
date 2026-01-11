@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import struct
 from decimal import Decimal
 from typing import Dict, List, Any, Type
@@ -8,14 +10,155 @@ OID_INT8 = 20  # bigint
 OID_INT2 = 21  # smallint
 OID_INT4 = 23  # integer
 OID_FLOAT8 = 701  # double precision (float8)
-OID_NUMERIC = 1700 # numeric, encoded in text format
+OID_NUMERIC = 1700  # numeric (a.k.a. DECIMAL)
+
+# --- PostgreSQL NUMERIC binary format (pgwire) ---------------------------------
+#
+# The pgwire "binary" representation of NUMERIC is NOT IEEE, and it's also
+# not a base-2 encoding. Postgres uses a base-10,000 (base 1e4) digit array.
+# Each "digit" is a signed int16 (but values are 0..9999), and the header uses
+# several int16 fields.
+#
+# On the wire, a NUMERIC value is encoded as:
+#
+#   int16 ndigits   : number of base-10000 digits that follow
+#   int16 weight    : index of the first digit relative to the decimal point
+#   int16 sign      : 0x0000 = POS, 0x4000 = NEG, 0xC000 = NaN
+#   int16 dscale    : number of decimal digits after the decimal point (base-10)
+#   int16 digits[]  : ndigits values, each 0..9999 (base-10000)
+#
+# Interpretation (conceptually):
+#
+#   value = sum(digits[i] * 10000^(weight - i) for i in 0..ndigits-1)
+#
+# dscale is used by clients to render the correct number of decimal digits and
+# is not necessarily a multiple of 4.
+#
+# The key trick for encoding a Decimal that has a base-10 scale (dscale) which
+# is not divisible by 4 is to "pad" the coefficient by multiplying by 10^pad so
+# that the scale becomes a multiple of 4, then set weight accordingly. The math
+# works out because:
+#
+#   pad = ceil(dscale/4)*4 - dscale
+#   coefficient_adj = coefficient * 10^pad
+#   scale_groups = ceil(dscale/4)
+#
+#   coefficient / 10^dscale == coefficient_adj / 10000^scale_groups
+#
+# This matches the Postgres base-10000 digit semantics.
+#
+# References (format): PostgreSQL source `src/backend/utils/adt/numeric.c`
+# and pgwire type docs in the PostgreSQL protocol documentation.
+
+NUMERIC_SIGN_POS = 0x0000
+NUMERIC_SIGN_NEG = 0x4000
+NUMERIC_SIGN_NAN = 0xC000
+
+
+def _encode_int2(v: int) -> bytes:
+    return struct.pack('>I', 2) + struct.pack('>h', v)
+
+
+def _encode_int4(v: int) -> bytes:
+    return struct.pack('>I', 4) + struct.pack('>i', v)
+
+
+def _encode_int8(v: int) -> bytes:
+    return struct.pack('>I', 8) + struct.pack('>q', v)
+
+
+def _encode_float8(v: float) -> bytes:
+    return struct.pack('>I', 8) + struct.pack('>d', v)
+
+
+def _encode_numeric(v: Decimal) -> bytes:
+    """Encode a Python Decimal into Postgres NUMERIC (OID 1700) binary format.
+
+    Returns bytes in the format expected by `DataRow.encode()` for binary types:
+    a 4-byte big-endian length prefix, followed by the NUMERIC payload.
+    """
+
+    # Note: Decimal can represent NaN, +/-Infinity depending on context.
+    # Postgres NUMERIC supports NaN but does not support Infinity.
+    if v.is_nan():
+        payload = struct.pack('>hhhh', 0, 0, NUMERIC_SIGN_NAN, 0)
+        return struct.pack('>I', len(payload)) + payload
+    if v.is_infinite():
+        raise ValueError('PostgreSQL NUMERIC does not support Infinity')
+
+    # Use absolute value for digit extraction. We handle sign separately.
+    sign_code = NUMERIC_SIGN_NEG if v.is_signed() else NUMERIC_SIGN_POS
+    abs_v = -v if v.is_signed() else v
+
+    tup = abs_v.as_tuple()
+    # DecimalTuple: sign, digits (tuple[int]), exponent (int)
+    digits10 = list(tup.digits) or [0]
+    exponent = tup.exponent
+
+    # Convert Decimal (digits10, exponent) into an integer coefficient and a
+    # base-10 scale (dscale).
+    #
+    # Example:  Decimal('123.45') -> digits10=12345, exponent=-2
+    #           coefficient=12345, dscale=2, value=coefficient/10^dscale
+    #
+    # Example:  Decimal('1E+3') -> digits10=1, exponent=3
+    #           coefficient=1000, dscale=0
+    if exponent >= 0:
+        coefficient = int(''.join(str(d) for d in digits10)) * (10 ** exponent)
+        dscale = 0
+    else:
+        coefficient = int(''.join(str(d) for d in digits10))
+        dscale = -exponent
+
+    # Normalise negative zero: Postgres treats -0 and 0 the same.
+    if coefficient == 0:
+        sign_code = NUMERIC_SIGN_POS
+
+    # Postgres stores digits in base-10000, but dscale is base-10. To align the
+    # decimal point to a base-10000 boundary we right-pad the coefficient by a
+    # power of 10 so that dscale becomes a multiple of 4.
+    scale_groups = (dscale + 3) // 4  # ceil(dscale / 4)
+    pad = scale_groups * 4 - dscale   # 0..3
+    coefficient_adj = coefficient * (10 ** pad)
+
+    # Split adjusted coefficient into base-10000 digits.
+    # digits10000[0] is the most-significant base-10000 digit.
+    digits10000: list[int] = []
+    tmp = coefficient_adj
+    while tmp:
+        tmp, rem = divmod(tmp, 10000)
+        digits10000.append(rem)
+    digits10000.reverse()
+
+    # Strip leading and trailing zero groups to produce a compact encoding.
+    # If we remove a leading digit, we must decrement weight because the first
+    # remaining digit moves one base-10000 position to the right.
+    weight = 0
+    if digits10000:
+        weight = len(digits10000) - scale_groups - 1
+        while digits10000 and digits10000[0] == 0:
+            digits10000.pop(0)
+            weight -= 1
+        while digits10000 and digits10000[-1] == 0:
+            digits10000.pop()
+
+    ndigits = len(digits10000)
+    if ndigits == 0:
+        # Postgres represents 0 as an empty digit array.
+        weight = 0
+
+    payload = struct.pack('>hhhh', ndigits, weight, sign_code, dscale)
+    for d in digits10000:
+        payload += struct.pack('>h', d)
+    return struct.pack('>I', len(payload)) + payload
 
 # Encoder functions for binary formats
 ENCODERS = {
-    OID_INT2: lambda v: struct.pack('>I', 2) + struct.pack('>h', v),
-    OID_INT4: lambda v: struct.pack('>I', 4) + struct.pack('>i', v),
-    OID_INT8: lambda v: struct.pack('>I', 8) + struct.pack('>q', v),
-    OID_FLOAT8: lambda v: struct.pack('>I', 8) + struct.pack('>d', v)
+    OID_INT2: _encode_int2,
+    OID_INT4: _encode_int4,
+    OID_INT8: _encode_int8,
+    OID_FLOAT8: _encode_float8,
+    OID_NUMERIC: _encode_numeric,
 }
 
 def to_sqltype(index: int, field_name: str, schema: list[int] = None, typ: Type | None = None) -> dict[str, Any]:
@@ -29,7 +172,7 @@ def to_sqltype(index: int, field_name: str, schema: list[int] = None, typ: Type 
     type_size = -1
     if schema is not None and 0 <= index < len(schema):
         oid = schema[index]
-        if oid in [OID_INT8, OID_INT2, OID_INT4, OID_FLOAT8]:  # int8, int2, int4, float8
+        if oid in [OID_INT8, OID_INT2, OID_INT4, OID_FLOAT8, OID_NUMERIC]:  # int8, int2, int4, float8, numeric
             format = 1 # binary pgasync expects binary
     elif typ == int:  # noqa: E721
         oid = OID_INT4  # int4
@@ -41,6 +184,7 @@ def to_sqltype(index: int, field_name: str, schema: list[int] = None, typ: Type 
         type_size = 8
     elif typ == Decimal:  # noqa: E721
         oid = OID_NUMERIC
+        format = 1  # binary
     return {
         'name': field_name,
         'table_oid': 0,
